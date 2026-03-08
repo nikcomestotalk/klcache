@@ -11,8 +11,8 @@ This architecture guarantees:
 - **Transparent API**: Your local application simply talks to its local sidecar (`http://127.0.0.1:9000`). If the key belongs to another node, the sidecar seamlessly proxies the HTTP request and returns the result.
 
 ## Architecture & Data Flow
-1. **Zero-Config Node Initialization**: A sidecar is launched with a unique `NODE_NAME`, `BIND_PORT` (for Gossip), and `API_PORT` (for HTTP requests). There's no need to point to a central or static element!
-2. **mDNS Auto-Discovery & Segregation**: The node broadcasts its presence via Multicast DNS on `_klcache_<APP_CLUSTER_ID>._tcp` using HashiCorp's `mdns`. This means that in orchestration layers like Kubernetes, if you define `APP_CLUSTER_ID="user-service"`, the sidecars will exclusively cluster with other pods running the exact same application. Sidecars running alongside a different app (e.g. `APP_CLUSTER_ID="auth-service"`) are completely segregated.
+1. **Sidecar Initialization**: A sidecar is launched with `APP_NAME` (the application it serves), `BIND_PORT` (gossip), and `API_PORT` (HTTP). In Kubernetes, it auto-detects the environment and uses DNS discovery; locally, it uses mDNS.
+2. **Same-App Discovery**: Sidecars with the same `APP_NAME` form one cluster. In Kubernetes, discovery uses DNS: resolve `{APP_NAME}.{namespace}.svc.cluster.local` (headless service) to get all pod IPs. Outside K8s, mDNS on `_klcache_<APP_NAME>._tcp` finds peers on the local network. Sidecars for different apps (e.g. `auth-service` vs `user-service`) never cluster together.
 3. **Gossip Protocol Formation**: Upon discovering a peer's IP and gossip port, the node connects to the cluster intelligently using HashiCorp's `memberlist` library, sharing metadata via custom `memberlist.Delegate` to share API ports.
 4. **Consistent Hashing**: All nodes individually run a Hash Ring populated with the cluster members. Since the hashing calculation (`xxhash`) is deterministic, all nodes agree on who owns which key based on the node names.
 5. **Data Operations & Security**: 

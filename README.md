@@ -24,17 +24,18 @@ What This Solves Unified cache across service replicas. Independent scaling per 
 
 # KLCache
 
-KLCache is a decentralized, peer-to-peer Key-Value cache sidecar application built in Go. It's designed to run alongside your primary services, providing a distributed, scalable caching layer without the need for a central master node or complex configuration.
+KLCache is a **sidecar-first** distributed cache. Run one KLCache container alongside each instance of your application; sidecars for the same application automatically discover each other and form a dedicated cache cluster. No Redis, no shared infrastructure—each service owns its cache.
 
 ## Key Features
 
-- **Zero-Config Auto-Discovery & Segregation**: Nodes automatically find each other on the local network using HashiCorp's **mDNS** (`hashicorp/mdns`). By configuring an `APP_CLUSTER_ID`, sidecars dynamically segregate themselves so a cluster solely binds horizontally across identical application pods (e.g. your `auth-service` cache won't collide with your `user-service` cache).
-- **Decentralized Cluster Management**: Utilizes the **Gossip Protocol** (`hashicorp/memberlist`) for node health-checking, failure detection, and cluster state dissemination. 
-- **Consistent Data Distribution**: Employs **Consistent Hashing** (`buraksezer/consistent` + `cespare/xxhash`) to deterministically route keys to specific nodes. If nodes join or leave, data ownership minimizes re-shuffling.
-- **Transparent Request Proxying**: Every node exposes an HTTP API (`/set`, `/get`, `/delete`). If a request targets a key that belongs to a remote node, the current node intercepts it and seamlessly proxies the request to the correct owner. Your app only ever has to talk to `localhost:9000`.
-- **Local-Only Overrides**: For operations that must stay on the current machine, add `?local=true` to any API endpoint to bypass clustering entirely.
-- **Strict Security Coupling**: By default, the API exclusively accepts traffic from `localhost`. If you add the `APP_AUTH_TOKEN` environment variable, non-localhost traffic (like proxy routing) must pass the Bearer token.
-- **Type-Safe Storage**: The in-memory cache strictly validates storing mapped Types (String keys to Strings, Integers, Booleans, or Floats).
+- **Same-App Discovery**: Sidecars with the same `APP_NAME` form one cluster. Your `user-service` sidecars only talk to other `user-service` sidecars—never to `auth-service` or other apps.
+- **Kubernetes-Native Discovery**: In Kubernetes, sidecars discover peers via DNS (headless service). No mDNS or multicast required.
+- **Local Dev (mDNS)**: Outside Kubernetes, sidecars use mDNS to find each other on the local network.
+- **Decentralized Cluster**: Gossip protocol (`memberlist`) for health-checking and membership; consistent hashing for key distribution.
+- **Transparent Proxying**: Your app talks only to `localhost:9000`. If a key lives on another sidecar, the local one proxies the request.
+- **Local-Only Override**: Add `?local=true` to any endpoint to bypass clustering.
+- **Security**: API accepts localhost by default; set `APP_AUTH_TOKEN` for Bearer auth on inter-pod proxy traffic.
+- **Type-Safe Storage**: Keys map to string, int, bool, or float64.
 
 ## Quick Start
 
@@ -43,26 +44,26 @@ KLCache is a decentralized, peer-to-peer Key-Value cache sidecar application bui
 go build -o klcache main.go
 ```
 
-### Running Locally with Auto-Discovery
+### Running Locally (mDNS Discovery)
 
-You can run multiple instances locally. Thanks to mDNS, they will find each other automatically without any initial `JOIN_ADDR` configuration.
+Run multiple sidecar instances on the same machine. They discover each other via mDNS when they share the same `APP_NAME`.
 
-**Terminal 1 (Node 1):**
+**Terminal 1:**
 ```bash
-BIND_PORT=8000 API_PORT=9000 NODE_NAME=node1 ./klcache
+APP_NAME=my-app BIND_PORT=8000 API_PORT=9000 NODE_NAME=node1 ./klcache
 ```
 
-**Terminal 2 (Node 2):**
+**Terminal 2:**
 ```bash
-BIND_PORT=8001 API_PORT=9001 NODE_NAME=node2 ./klcache
+APP_NAME=my-app BIND_PORT=8001 API_PORT=9001 NODE_NAME=node2 ./klcache
 ```
 
-**Terminal 3 (Node 3):**
+**Terminal 3:**
 ```bash
-BIND_PORT=8002 API_PORT=9002 NODE_NAME=node3 ./klcache
+APP_NAME=my-app BIND_PORT=8002 API_PORT=9002 NODE_NAME=node3 ./klcache
 ```
 
-You'll quickly see the nodes discovering each other via mDNS logs and forming a cluster!
+All three form one cluster for `my-app`. A different `APP_NAME` would form a separate cluster.
 
 ### Usage (API)
 Communicate with your local node (e.g., `http://127.0.0.1:9000`). If the key is hashed to be stored on Node 3, Node 1 will proxy it automatically!
@@ -87,13 +88,73 @@ curl -X POST "http://127.0.0.1:9000/delete?key=is_active"
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `BIND_ADDR` | IP Address for Gossip Protocol to bind to | `127.0.0.1` |
-| `BIND_PORT` | Port for Gossip Protocol and mDNS | `8000` |
-| `API_PORT` | Port for HTTP API and transparent inter-node proxying | `9000` |
-| `NODE_NAME` | Unique identifier for the instance | `node-{API_PORT}` |
-| `JOIN_ADDR` | Explicit IP:Port of an existing node (Useful if mDNS is disabled/cloud) | `""` |
-| `APP_AUTH_TOKEN` | Bearer token to authorize external proxy traffic | `""` |
-| `APP_CLUSTER_ID` | Identifies the namespace grouping for mDNS discovery | `"default"` |
+| `APP_NAME` | Application name — sidecars with same name form one cluster | `"default"` (or `APP_CLUSTER_ID`) |
+| `BIND_ADDR` | IP for gossip (use `0.0.0.0` in K8s) | `127.0.0.1` local; `0.0.0.0` in K8s |
+| `BIND_PORT` | Port for memberlist gossip | `8000` |
+| `API_PORT` | Port for HTTP API | `9000` |
+| `NODE_NAME` | Unique instance ID (in K8s: pod name via `HOSTNAME`) | `node-{API_PORT}` |
+| `POD_IP` | Pod IP in K8s (for advertising reachable address) | — set via downward API |
+| `KUBE_NAMESPACE` | Kubernetes namespace (for DNS discovery) | `"default"` or `POD_NAMESPACE` |
+| `JOIN_ADDR` | Explicit node to join (overrides discovery) | `""` |
+| `APP_AUTH_TOKEN` | Bearer token for inter-pod proxy traffic | `""` |
 
-## Production Use
-For environments where mDNS/multicast is disabled (like AWS VPCs or Kubernetes), you can provide a static IP to `JOIN_ADDR` for the initial seed, or integrate a DNS-based discovery record that resolves to the instances.
+## Kubernetes Deployment (Sidecar)
+
+Add KLCache as a sidecar container. Use a **headless service** so sidecars can discover each other via DNS.
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: user-service
+spec:
+  clusterIP: None   # Headless — DNS returns all pod IPs
+  selector:
+    app: user-service
+  ports:
+    - port: 8000
+      name: gossip
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-service
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: user-service
+  template:
+    metadata:
+      labels:
+        app: user-service
+    spec:
+      containers:
+        - name: app
+          image: your-app:latest
+          # Your app talks to localhost:9000
+        - name: klcache
+          image: klcache:latest
+          env:
+            - name: APP_NAME
+              value: "user-service"   # Must match Service name
+            - name: BIND_PORT
+              value: "8000"
+            - name: API_PORT
+              value: "9000"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: KUBE_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          ports:
+            - containerPort: 8000
+              name: gossip
+            - containerPort: 9000
+              name: api
+```
+
+Sidecars discover peers by resolving `user-service.{namespace}.svc.cluster.local` (returns all pod IPs). Each sidecar joins the others on the gossip port and forms a cluster.
